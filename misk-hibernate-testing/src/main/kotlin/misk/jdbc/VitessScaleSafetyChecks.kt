@@ -29,6 +29,7 @@ import java.sql.SQLException
 import java.sql.SQLSyntaxErrorException
 import java.sql.Timestamp
 import java.util.Locale
+import java.util.Stack
 import javax.inject.Singleton
 import javax.sql.DataSource
 
@@ -236,7 +237,7 @@ internal class Explanation {
   }
 }
 
-open class ExtendedQueryExectionListener : QueryExecutionListener, MethodExecutionListener {
+open class ExtendedQueryExecutionListener : QueryExecutionListener, MethodExecutionListener {
   override fun beforeMethod(executionContext: MethodExecutionContext) {
     if (isStartTransaction(executionContext)) {
       beforeStartTransaction()
@@ -380,8 +381,8 @@ class VitessScaleSafetyChecks(
     return proxy
   }
 
-  inner class FullScatterDetector : ExtendedQueryExectionListener() {
-    val count = ThreadLocal.withInitial { 0 }
+  inner class FullScatterDetector : ExtendedQueryExecutionListener() {
+    private val count: ThreadLocal<Int> = ThreadLocal.withInitial { 0 }
 
     override fun beforeQuery(query: String) {
       if (!transacter.isCheckEnabled(Check.FULL_SCATTER)) return
@@ -402,7 +403,7 @@ class VitessScaleSafetyChecks(
     }
   }
 
-  inner class TableScanDetector : ExtendedQueryExectionListener() {
+  inner class TableScanDetector : ExtendedQueryExecutionListener() {
     private val mysqlTimeBeforeQuery: ThreadLocal<Timestamp?> =
         ThreadLocal.withInitial { null }
 
@@ -473,18 +474,18 @@ class VitessScaleSafetyChecks(
     }
   }
 
-  inner class CowriteDetector : ExtendedQueryExectionListener() {
-    private val keyspaceIdsThisTransaction: ThreadLocal<LinkedHashSet<String>> =
-        ThreadLocal.withInitial { LinkedHashSet<String>() }
+  inner class CowriteDetector : ExtendedQueryExecutionListener() {
+
+    private val vtgateKeyspaceIdRegex = "vtgate:: keyspace_id:([^ ]+)".toRegex()
+    private val transactionStack: ThreadLocal<Stack<LinkedHashSet<String>>> =
+        ThreadLocal.withInitial { Stack<LinkedHashSet<String>>() }
 
     override fun beforeStartTransaction() {
       // Connect before the query because connecting spits out a bunch of crap in the general_log
       // that makes it harder for us to get to the thread id
       connect()
 
-      check(keyspaceIdsThisTransaction.get().isEmpty()) {
-        "Transaction state has not been cleaned up, beforeEndTransaction was never executed"
-      }
+      transactionStack.get().push(LinkedHashSet())
     }
 
     override fun afterQuery(query: String) {
@@ -493,10 +494,10 @@ class VitessScaleSafetyChecks(
 
       val queryInDatabase = extractLastDmlQuery() ?: return
 
-      val m = "vtgate:: keyspace_id:([^ ]+)".toRegex().find(queryInDatabase) ?: return
+      val m = vtgateKeyspaceIdRegex.find(queryInDatabase) ?: return
       val keyspaceId = m.groupValues[1]
 
-      val keyspaceIds = keyspaceIdsThisTransaction.get()
+      val keyspaceIds = transactionStack.get().peek()
       keyspaceIds.add(keyspaceId)
 
       if (keyspaceIds.size > 1) {
@@ -508,12 +509,12 @@ class VitessScaleSafetyChecks(
     }
 
     override fun beforeEndTransaction() {
-      keyspaceIdsThisTransaction.get().clear()
+      transactionStack.get().pop()
     }
   }
 
-  val COMMENT_PATTERN = "/\\*+[^*]*\\*+(?:[^/*][^*]*\\*+)*/".toRegex()
-  val DML = setOf("insert", "delete", "update")
+  private val COMMENT_PATTERN = "/\\*+[^*]*\\*+(?:[^/*][^*]*\\*+)*/".toRegex()
+  private val DML = setOf("insert", "delete", "update")
 
   private fun isDml(query: String): Boolean {
     val first = query
